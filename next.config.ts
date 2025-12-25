@@ -53,11 +53,11 @@ const nextConfig: NextConfig = {
       },
       {
         source: '/api/auth/status',
-        destination: `${TARGET_SERVER_BASE_URL}/auth/status`,
+        destination: `${TARGET_SERVER_BASE_URL}/api/auth/status`,
       },
       {
         source: '/api/auth/validate',
-        destination: `${TARGET_SERVER_BASE_URL}/auth/validate`,
+        destination: `${TARGET_SERVER_BASE_URL}/api/auth/validate`,
       },
       {
         source: '/api/lang/config',
