@@ -173,6 +173,18 @@ const createBitbucketHeaders = (bitbucketToken: string): HeadersInit => {
   return headers;
 };
 
+const createGitcodeHeaders = (gitcodeToken: string): HeadersInit => {
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+  };
+
+  if (gitcodeToken) {
+    headers['Authorization'] = `Bearer ${gitcodeToken}`;
+  }
+
+  return headers;
+};
+
 
 export default function RepoWikiPage() {
   // Get route parameters and search params
@@ -205,9 +217,11 @@ export default function RepoWikiPage() {
     ? 'bitbucket'
     : repoHost?.includes('gitlab')
       ? 'gitlab'
-      : repoHost?.includes('github')
-        ? 'github'
-        : searchParams.get('type') || 'github';
+      : repoHost?.includes('gitcode')
+        ? 'gitcode'
+        : repoHost?.includes('github')
+          ? 'github'
+          : searchParams.get('type') || 'github';
 
   // Import language context for translations
   const { messages } = useLanguage();
@@ -1479,6 +1493,98 @@ IMPORTANT:
           console.warn('Could not fetch Bitbucket README.md, continuing with empty README', err);
         }
       }
+      else if (effectiveRepoInfo.type === 'gitcode') {
+        // GitCode API approach - similar to GitHub but uses api.gitcode.com/api/v5
+        const projectDomain = extractUrlDomain(effectiveRepoInfo.repoUrl ?? "https://gitcode.com");
+        const projectPath = extractUrlPath(effectiveRepoInfo.repoUrl ?? '')?.replace(/\.git$/, '') || `${owner}/${repo}`;
+
+        const headers = createGitcodeHeaders(currentToken);
+        let treeData = null;
+        let apiErrorDetails = '';
+        let defaultBranchLocal = null;
+
+        // Determine the GitCode API base URL
+        const getGitcodeApiUrl = (repoDomain: string | null): string => {
+          // GitCode API base URL is https://api.gitcode.com/api/v5
+          return 'https://api.gitcode.com/api/v5';
+        };
+
+        const gitcodeApiBaseUrl = getGitcodeApiUrl(projectDomain);
+
+        // First, try to get the default branch from the repository info
+        try {
+          const repoInfoResponse = await fetch(`${gitcodeApiBaseUrl}/repos/${owner}/${repo}`, {
+            headers: createGitcodeHeaders(currentToken)
+          });
+
+          if (repoInfoResponse.ok) {
+            const repoData = await repoInfoResponse.json();
+            defaultBranchLocal = repoData.default_branch;
+            console.log(`Found GitCode default branch: ${defaultBranchLocal}`);
+            setDefaultBranch(defaultBranchLocal || 'main');
+          }
+        } catch (err) {
+          console.warn('Could not fetch GitCode repository info for default branch:', err);
+        }
+
+        // Create list of branches to try, prioritizing the actual default branch
+        const branchesToTry = defaultBranchLocal
+          ? [defaultBranchLocal, 'main', 'master'].filter((branch, index, arr) => arr.indexOf(branch) === index)
+          : ['main', 'master'];
+
+        for (const branch of branchesToTry) {
+          const apiUrl = `${gitcodeApiBaseUrl}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+          console.log(`Fetching GitCode repository structure from branch: ${branch}`);
+          try {
+            const response = await fetch(apiUrl, {
+              headers: createGitcodeHeaders(currentToken)
+            });
+
+            if (response.ok) {
+              treeData = await response.json();
+              console.log('Successfully fetched GitCode repository structure');
+              break;
+            } else {
+              const errorData = await response.text();
+              apiErrorDetails = `Status: ${response.status}, Response: ${errorData}`;
+              console.error(`Error fetching GitCode repository structure: ${apiErrorDetails}`);
+            }
+          } catch (err) {
+            console.error(`Network error fetching GitCode branch ${branch}:`, err);
+          }
+        }
+
+        if (!treeData || !treeData.tree) {
+          if (apiErrorDetails) {
+            throw new Error(`Could not fetch GitCode repository structure. API Error: ${apiErrorDetails}`);
+          } else {
+            throw new Error('Could not fetch GitCode repository structure. Repository might not exist, be empty or private.');
+          }
+        }
+
+        // Convert tree data to a string representation
+        fileTreeData = treeData.tree
+          .filter((item: { type: string; path: string }) => item.type === 'blob')
+          .map((item: { type: string; path: string }) => item.path)
+          .join('\n');
+
+        // Try to fetch README.md content
+        try {
+          const readmeResponse = await fetch(`${gitcodeApiBaseUrl}/repos/${owner}/${repo}/readme`, {
+            headers: createGitcodeHeaders(currentToken)
+          });
+
+          if (readmeResponse.ok) {
+            const readmeData = await readmeResponse.json();
+            // GitCode API returns base64 encoded content like GitHub
+            readmeContent = atob(readmeData.content);
+          } else {
+            console.warn(`Could not fetch GitCode README.md, status: ${readmeResponse.status}`);
+          }
+        } catch (err) {
+          console.warn('Could not fetch GitCode README.md, continuing with empty README', err);
+        }
+      }
 
       // Now determine the wiki structure
       await determineWikiStructure(fileTreeData, readmeContent, owner, repo);
@@ -2269,7 +2375,7 @@ IMPORTANT:
         onApply={confirmRefresh}
         showWikiType={true}
         showTokenInput={effectiveRepoInfo.type !== 'local' && !currentToken} // Show token input if not local and no current token
-        repositoryType={effectiveRepoInfo.type as 'github' | 'gitlab' | 'bitbucket'}
+        repositoryType={effectiveRepoInfo.type as 'github' | 'gitlab' | 'bitbucket' | 'gitcode'}
         authRequired={authRequired}
         authCode={authCode}
         setAuthCode={setAuthCode}

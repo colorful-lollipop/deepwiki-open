@@ -71,7 +71,7 @@ def count_tokens(text: str, embedder_type: str = None, is_ollama_embedder: bool 
 
 def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_token: str = None) -> str:
     """
-    Downloads a Git repository (GitHub, GitLab, or Bitbucket) to a specified local path.
+    Downloads a Git repository (GitHub, GitLab, Bitbucket, or GitCode) to a specified local path.
 
     Args:
         repo_type(str): Type of repository
@@ -118,6 +118,9 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
             elif repo_type == "bitbucket":
                 # Format: https://x-token-auth:{token}@bitbucket.org/owner/repo.git
                 clone_url = urlunparse((parsed.scheme, f"x-token-auth:{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
+            elif repo_type == "gitcode":
+                # Format: https://{token}@gitcode.com/owner/repo.git
+                clone_url = urlunparse((parsed.scheme, f"{encoded_token}@{parsed.netloc}", parsed.path, '', '', ''))
 
             logger.info("Using access token for authentication")
 
@@ -683,10 +686,93 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
 
+def get_gitcode_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
+    """
+    Retrieves the content of a file from a GitCode repository using the GitCode API.
+
+    Args:
+        repo_url (str): The URL of the GitCode repository (e.g., "https://gitcode.com/username/repo")
+        file_path (str): The path to the file within the repository (e.g., "src/main.py")
+        access_token (str, optional): GitCode personal access token for private repositories
+
+    Returns:
+        str: The content of the file as a string
+    """
+    try:
+        # Parse and validate the URL
+        parsed_url = urlparse(repo_url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise ValueError("Not a valid GitCode repository URL")
+
+        # Extract owner and repo name
+        path_parts = parsed_url.path.strip('/').split('/')
+        if len(path_parts) < 2:
+            raise ValueError("Invalid GitCode URL format - expected format: https://gitcode.com/owner/repo")
+
+        owner = path_parts[-2]
+        repo = path_parts[-1].replace(".git", "")
+
+        # Try to get the default branch from the repository info
+        default_branch = None
+        try:
+            repo_info_url = f"https://api.gitcode.com/api/v5/repos/{owner}/{repo}"
+            repo_headers = {}
+            if access_token:
+                repo_headers["Authorization"] = f"Bearer {access_token}"
+
+            repo_response = requests.get(repo_info_url, headers=repo_headers)
+            if repo_response.status_code == 200:
+                repo_data = repo_response.json()
+                default_branch = repo_data.get('default_branch', 'main')
+                logger.info(f"Found GitCode default branch: {default_branch}")
+            else:
+                logger.warning(f"Could not fetch GitCode repository info, using 'main' as default branch")
+                default_branch = 'main'
+        except Exception as e:
+            logger.warning(f"Error fetching GitCode repository info: {e}, using 'main' as default branch")
+            default_branch = 'main'
+
+        # Use GitCode API to get file content
+        # The API endpoint for getting file content is: /api/v5/repos/{owner}/{repo}/contents/{path}
+        api_url = f"https://api.gitcode.com/api/v5/repos/{owner}/{repo}/contents/{file_path}?ref={default_branch}"
+
+        # Fetch file content from GitCode API
+        headers = {}
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        logger.info(f"Fetching file content from GitCode API: {api_url}")
+        try:
+            response = requests.get(api_url, headers=headers)
+            if response.status_code == 200:
+                content_data = response.json()
+                # GitCode API returns base64 encoded content like GitHub
+                if "content" in content_data and "encoding" in content_data:
+                    if content_data["encoding"] == "base64":
+                        content_base64 = content_data["content"].replace("\n", "")
+                        content = base64.b64decode(content_base64).decode("utf-8")
+                        return content
+                    else:
+                        raise ValueError(f"Unexpected encoding: {content_data['encoding']}")
+                else:
+                    raise ValueError("File content not found in GitCode API response")
+            elif response.status_code == 404:
+                raise ValueError("File not found on GitCode. Please check the file path and repository.")
+            elif response.status_code == 401:
+                raise ValueError("Unauthorized access to GitCode. Please check your access token.")
+            elif response.status_code == 403:
+                raise ValueError("Forbidden access to GitCode. You might not have permission to access this file.")
+            else:
+                response.raise_for_status()
+        except RequestException as e:
+            raise ValueError(f"Error fetching file content: {e}")
+
+    except Exception as e:
+        raise ValueError(f"Failed to get GitCode file content: {str(e)}")
+
 
 def get_file_content(repo_url: str, file_path: str, repo_type: str = None, access_token: str = None) -> str:
     """
-    Retrieves the content of a file from a Git repository (GitHub or GitLab).
+    Retrieves the content of a file from a Git repository (GitHub, GitLab, Bitbucket, or GitCode).
 
     Args:
         repo_type (str): Type of repository
@@ -706,8 +792,10 @@ def get_file_content(repo_url: str, file_path: str, repo_type: str = None, acces
         return get_gitlab_file_content(repo_url, file_path, access_token)
     elif repo_type == "bitbucket":
         return get_bitbucket_file_content(repo_url, file_path, access_token)
+    elif repo_type == "gitcode":
+        return get_gitcode_file_content(repo_url, file_path, access_token)
     else:
-        raise ValueError("Unsupported repository type. Only GitHub, GitLab, and Bitbucket are supported.")
+        raise ValueError("Unsupported repository type. Only GitHub, GitLab, Bitbucket, and GitCode are supported.")
 
 class DatabaseManager:
     """
@@ -763,10 +851,11 @@ class DatabaseManager:
         # Extract owner and repo name to create unique identifier
         url_parts = repo_url_or_path.rstrip('/').split('/')
 
-        if repo_type in ["github", "gitlab", "bitbucket"] and len(url_parts) >= 5:
+        if repo_type in ["github", "gitlab", "bitbucket", "gitcode"] and len(url_parts) >= 5:
             # GitHub URL format: https://github.com/owner/repo
             # GitLab URL format: https://gitlab.com/owner/repo or https://gitlab.com/group/subgroup/repo
             # Bitbucket URL format: https://bitbucket.org/owner/repo
+            # GitCode URL format: https://gitcode.com/owner/repo
             owner = url_parts[-2]
             repo = url_parts[-1].replace(".git", "")
             repo_name = f"{owner}_{repo}"
