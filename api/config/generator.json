@@ -41,23 +41,23 @@
       }
     },
     "openai": {
-      "default_model": "gpt-5-nano",
+      "default_model": "glm-4.7",
       "supportsCustomModel": true,
       "models": {
-        "gpt-5": {
+        "glm-4.7": {
           "temperature": 1.0
         },
-        "gpt-5-nano": {
+        "glm-4.6": {
           "temperature": 1.0
         },
-        "gpt-5-mini": {
-          "temperature": 1.0
+        "glm-4.5": {
+          "temperature": 0.6
         },
-        "gpt-4o": {
+        "glm-4.5-air": {
           "temperature": 0.7,
           "top_p": 0.8
         },
-        "gpt-4.1": {
+        "glm-4.5-x": {
           "temperature": 0.7,
           "top_p": 0.8
         },

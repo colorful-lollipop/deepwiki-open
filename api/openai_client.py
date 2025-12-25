@@ -18,6 +18,7 @@ import re
 
 import logging
 import backoff
+import tiktoken
 
 # optional import
 from adalflow.utils.lazy_import import safe_import, OptionalPackages
@@ -52,6 +53,10 @@ from adalflow.components.model_client.utils import parse_embedding_response
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
+
+# ZhipuAI Embedding limits
+ZHIPUAI_MAX_BATCH_TOKENS = 8000  # Total tokens per batch (8K context window)
+ZHIPUAI_MAX_ITEMS_PER_BATCH = 64  # Maximum items per batch
 
 
 # completion parsing functions and you can combine them into one singple chat completion parser
@@ -186,6 +191,96 @@ class OpenAIClient(ModelClient):
         )
         self._input_type = input_type
         self._api_kwargs = {}  # add api kwargs when the OpenAI Client is called
+        self._token_encoding = None  # Lazy load tiktoken encoding
+
+    def _get_encoding(self):
+        """Lazy load tiktoken encoding."""
+        if self._token_encoding is None:
+            try:
+                self._token_encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception as e:
+                log.warning(f"Failed to load tiktoken encoding: {e}")
+                self._token_encoding = None
+        return self._token_encoding
+
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens in a text string."""
+        encoding = self._get_encoding()
+        if encoding:
+            try:
+                return len(encoding.encode(text))
+            except Exception as e:
+                log.warning(f"Error counting tokens: {e}")
+        # Fallback: rough approximation (1 token ≈ 4 characters for English, less for Chinese)
+        return len(text) // 3
+
+    def _truncate_text(self, text: str, max_tokens: int) -> str:
+        """Truncate text to max tokens if needed."""
+        token_count = self._count_tokens(text)
+        if token_count <= max_tokens:
+            return text
+
+        encoding = self._get_encoding()
+        if encoding:
+            try:
+                tokens = encoding.encode(text)
+                truncated = encoding.decode(tokens[:max_tokens])
+                log.warning(f"Truncated text from {token_count} to {max_tokens} tokens")
+                return truncated
+            except Exception as e:
+                log.warning(f"Error truncating text: {e}")
+
+        # Fallback: character-based truncation
+        target_length = int(len(text) * (max_tokens / token_count))
+        return text[:target_length]
+
+    def _create_smart_batches(self, input_data: List[str], max_total_tokens: int, max_items: int) -> List[List[str]]:
+        """
+        Create smart batches that respect token limits.
+
+        Args:
+            input_data: List of text strings to batch
+            max_total_tokens: Maximum total tokens per batch
+            max_items: Maximum number of items per batch
+
+        Returns:
+            List of batches, where each batch is a list of text strings
+        """
+        batches = []
+        current_batch = []
+        current_tokens = 0
+
+        for text in input_data:
+            text_tokens = self._count_tokens(text)
+
+            # Check if adding this text would exceed limits
+            would_exceed_total = (current_tokens + text_tokens) > max_total_tokens
+            would_exceed_items = len(current_batch) >= max_items
+
+            # Warning for very long single texts (but don't truncate)
+            if text_tokens > 1000:
+                log.warning(f"Single text has {text_tokens} tokens. Consider reducing chunk_size in text_splitter config.")
+
+            if would_exceed_items or (would_exceed_total and current_batch):
+                # Start a new batch
+                batches.append(current_batch)
+                current_batch = [text]
+                current_tokens = text_tokens
+            else:
+                # Add to current batch
+                current_batch.append(text)
+                current_tokens += text_tokens
+
+        # Add the last batch
+        if current_batch:
+            batches.append(current_batch)
+
+        log.info(f"Created {len(batches)} batches from {len(input_data)} items")
+        for i, batch in enumerate(batches):
+            batch_tokens = sum(self._count_tokens(text) for text in batch)
+            log.info(f"  Batch {i+1}: {len(batch)} items, ~{batch_tokens} tokens")
+
+        return batches
 
     def init_sync_client(self):
         api_key = self._api_key or os.getenv(self._env_api_key_name)
@@ -298,6 +393,12 @@ class OpenAIClient(ModelClient):
             # convert input to input
             if not isinstance(input, Sequence):
                 raise TypeError("input must be a sequence of text")
+
+            # ZhipuAI limit: maximum 64 items per batch
+            MAX_BATCH_SIZE = 64
+            if len(input) > MAX_BATCH_SIZE:
+                log.warning(f"Input size {len(input)} exceeds max batch size {MAX_BATCH_SIZE}. Will be processed in batches.")
+
             final_model_kwargs["input"] = input
         elif model_type == ModelType.LLM:
             # convert input to messages
@@ -412,10 +513,124 @@ class OpenAIClient(ModelClient):
         """
         kwargs is the combined input and model_kwargs.  Support streaming call.
         """
-        log.info(f"api_kwargs: {api_kwargs}")
+        log.info(f"[DEBUG] api_kwargs: {api_kwargs}")
+        log.info(f"[DEBUG] api_kwargs keys: {list(api_kwargs.keys())}")
         self._api_kwargs = api_kwargs
         if model_type == ModelType.EMBEDDER:
-            return self.sync_client.embeddings.create(**api_kwargs)
+            # Handle batch requests with smart batching for ZhipuAI
+            input_data = api_kwargs.get("input", [])
+
+            # Validate and clean input data
+            if isinstance(input_data, list):
+                original_len = len(input_data)
+                # Remove empty strings and None values
+                input_data = [item for item in input_data if item and str(item).strip()]
+                if len(input_data) != original_len:
+                    log.warning(f"[DEBUG] Filtered {original_len - len(input_data)} empty/invalid inputs from {original_len} total")
+                    # Update api_kwargs with cleaned data
+                    api_kwargs = {**api_kwargs, "input": input_data}
+
+                # Check if there's any data left
+                if len(input_data) == 0:
+                    log.error("[ERROR] No valid input data after filtering empty strings")
+                    raise ValueError("Cannot process empty input list")
+
+                # Log sample of input data for debugging
+                if len(input_data) > 0:
+                    sample = input_data[0][:100] if len(str(input_data[0])) > 100 else str(input_data[0])
+                    log.info(f"[DEBUG] Sample input (first item): {repr(sample)}")
+                    log.info(f"[DEBUG] Total input items: {len(input_data)}")
+
+            # Check if using ZhipuAI
+            is_zhipuai = "bigmodel.cn" in self.base_url
+
+            if is_zhipuai:
+                # ZhipuAI: Use smart batching with 8K token limit
+                log.info("[ZhipuAI] Using smart batching with 8K token limit per batch")
+
+                # Filter parameters for ZhipuAI compatibility
+                ZHIPUAI_SUPPORTED_PARAMS = {"model", "input", "dimensions"}
+                filtered_kwargs = {k: v for k, v in api_kwargs.items() if k in ZHIPUAI_SUPPORTED_PARAMS}
+                removed_params = set(api_kwargs.keys()) - ZHIPUAI_SUPPORTED_PARAMS
+                if removed_params:
+                    log.warning(f"[ZhipuAI] Removing unsupported params: {removed_params}")
+
+                # Create smart batches
+                batches = self._create_smart_batches(
+                    input_data,
+                    max_total_tokens=ZHIPUAI_MAX_BATCH_TOKENS,
+                    max_items=ZHIPUAI_MAX_ITEMS_PER_BATCH
+                )
+
+                # Process each batch
+                all_embeddings = []
+                global_index = 0
+
+                for i, batch in enumerate(batches):
+                    batch_kwargs = filtered_kwargs.copy()
+                    batch_kwargs["input"] = batch
+
+                    log.info(f"[ZhipuAI] Processing batch {i+1}/{len(batches)}")
+                    batch_response = self.sync_client.embeddings.create(**batch_kwargs)
+
+                    # Adjust index for each embedding to maintain global ordering
+                    for emb in batch_response.data:
+                        if hasattr(emb, 'index'):
+                            object.__setattr__(emb, 'index', global_index)
+                        all_embeddings.append(emb)
+                        global_index += 1
+
+                # Construct complete response
+                final_response = CreateEmbeddingResponse(
+                    data=all_embeddings,
+                    model=api_kwargs.get("model", ""),
+                    object="list",
+                    usage={
+                        "prompt_tokens": sum(self._count_tokens(text) for text in input_data),
+                        "total_tokens": sum(self._count_tokens(text) for text in input_data)
+                    }
+                )
+                return final_response
+            else:
+                # Standard OpenAI: Use simple batching
+                MAX_BATCH_SIZE = 64
+
+                if len(input_data) <= MAX_BATCH_SIZE:
+                    # Direct call
+                    log.info(f"[DEBUG] Sending direct API request with params:")
+                    log.info(f"  - model: {api_kwargs.get('model')}")
+                    log.info(f"  - input length: {len(input_data)}")
+                    return self.sync_client.embeddings.create(**api_kwargs)
+                else:
+                    # Process in batches
+                    all_embeddings = []
+                    total_batches = (len(input_data) + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+                    global_index = 0
+
+                    for i in range(0, len(input_data), MAX_BATCH_SIZE):
+                        batch = input_data[i:i + MAX_BATCH_SIZE]
+                        batch_kwargs = api_kwargs.copy()
+                        batch_kwargs["input"] = batch
+
+                        log.info(f"Processing batch {i // MAX_BATCH_SIZE + 1}/{total_batches}")
+                        batch_response = self.sync_client.embeddings.create(**batch_kwargs)
+
+                        for emb in batch_response.data:
+                            if hasattr(emb, 'index'):
+                                object.__setattr__(emb, 'index', global_index)
+                            all_embeddings.append(emb)
+                            global_index += 1
+
+                    final_response = CreateEmbeddingResponse(
+                        data=all_embeddings,
+                        model=api_kwargs.get("model", ""),
+                        object="list",
+                        usage={
+                            "prompt_tokens": sum(len(batch) for batch in [input_data[i:i+MAX_BATCH_SIZE] for i in range(0, len(input_data), MAX_BATCH_SIZE)]),
+                            "total_tokens": sum(len(batch) for batch in [input_data[i:i+MAX_BATCH_SIZE] for i in range(0, len(input_data), MAX_BATCH_SIZE)])
+                        }
+                    )
+                    return final_response
         elif model_type == ModelType.LLM:
             if "stream" in api_kwargs and api_kwargs.get("stream", False):
                 log.debug("streaming call")
@@ -496,7 +711,114 @@ class OpenAIClient(ModelClient):
         if self.async_client is None:
             self.async_client = self.init_async_client()
         if model_type == ModelType.EMBEDDER:
-            return await self.async_client.embeddings.create(**api_kwargs)
+            # Handle batch requests with smart batching for ZhipuAI
+            input_data = api_kwargs.get("input", [])
+
+            # Validate and clean input data
+            if isinstance(input_data, list):
+                original_len = len(input_data)
+                # Remove empty strings and None values
+                input_data = [item for item in input_data if item and str(item).strip()]
+                if len(input_data) != original_len:
+                    log.warning(f"[DEBUG async] Filtered {original_len - len(input_data)} empty/invalid inputs from {original_len} total")
+                    api_kwargs = {**api_kwargs, "input": input_data}
+
+                if len(input_data) == 0:
+                    log.error("[ERROR async] No valid input data after filtering empty strings")
+                    raise ValueError("Cannot process empty input list")
+
+                # Log sample of input data for debugging
+                if len(input_data) > 0:
+                    sample = input_data[0][:100] if len(str(input_data[0])) > 100 else str(input_data[0])
+                    log.info(f"[DEBUG async] Sample input (first item): {repr(sample)}")
+                    log.info(f"[DEBUG async] Total input items: {len(input_data)}")
+
+            # Check if using ZhipuAI
+            is_zhipuai = "bigmodel.cn" in self.base_url
+
+            if is_zhipuai:
+                # ZhipuAI: Use smart batching with 8K token limit
+                log.info("[ZhipuAI async] Using smart batching with 8K token limit per batch")
+
+                # Filter parameters for ZhipuAI compatibility
+                ZHIPUAI_SUPPORTED_PARAMS = {"model", "input", "dimensions"}
+                filtered_kwargs = {k: v for k, v in api_kwargs.items() if k in ZHIPUAI_SUPPORTED_PARAMS}
+                removed_params = set(api_kwargs.keys()) - ZHIPUAI_SUPPORTED_PARAMS
+                if removed_params:
+                    log.warning(f"[ZhipuAI async] Removing unsupported params: {removed_params}")
+
+                # Create smart batches
+                batches = self._create_smart_batches(
+                    input_data,
+                    max_total_tokens=ZHIPUAI_MAX_BATCH_TOKENS,
+                    max_items=ZHIPUAI_MAX_ITEMS_PER_BATCH
+                )
+
+                # Process each batch
+                all_embeddings = []
+                global_index = 0
+
+                for i, batch in enumerate(batches):
+                    batch_kwargs = filtered_kwargs.copy()
+                    batch_kwargs["input"] = batch
+
+                    log.info(f"[ZhipuAI async] Processing batch {i+1}/{len(batches)}")
+                    batch_response = await self.async_client.embeddings.create(**batch_kwargs)
+
+                    # Adjust index for each embedding to maintain global ordering
+                    for emb in batch_response.data:
+                        if hasattr(emb, 'index'):
+                            object.__setattr__(emb, 'index', global_index)
+                        all_embeddings.append(emb)
+                        global_index += 1
+
+                # Construct complete response
+                final_response = CreateEmbeddingResponse(
+                    data=all_embeddings,
+                    model=api_kwargs.get("model", ""),
+                    object="list",
+                    usage={
+                        "prompt_tokens": sum(self._count_tokens(text) for text in input_data),
+                        "total_tokens": sum(self._count_tokens(text) for text in input_data)
+                    }
+                )
+                return final_response
+            else:
+                # Standard OpenAI: Use simple batching
+                MAX_BATCH_SIZE = 64
+
+                if len(input_data) <= MAX_BATCH_SIZE:
+                    return await self.async_client.embeddings.create(**api_kwargs)
+                else:
+                    # Process in batches
+                    all_embeddings = []
+                    total_batches = (len(input_data) + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+                    global_index = 0
+
+                    for i in range(0, len(input_data), MAX_BATCH_SIZE):
+                        batch = input_data[i:i + MAX_BATCH_SIZE]
+                        batch_kwargs = api_kwargs.copy()
+                        batch_kwargs["input"] = batch
+
+                        log.info(f"Processing async batch {i // MAX_BATCH_SIZE + 1}/{total_batches}")
+                        batch_response = await self.async_client.embeddings.create(**batch_kwargs)
+
+                        for emb in batch_response.data:
+                            if hasattr(emb, 'index'):
+                                object.__setattr__(emb, 'index', global_index)
+                            all_embeddings.append(emb)
+                            global_index += 1
+
+                    final_response = CreateEmbeddingResponse(
+                        data=all_embeddings,
+                        model=api_kwargs.get("model", ""),
+                        object="list",
+                        usage={
+                            "prompt_tokens": sum(len(batch) for batch in [input_data[i:i+MAX_BATCH_SIZE] for i in range(0, len(input_data), MAX_BATCH_SIZE)]),
+                            "total_tokens": sum(len(batch) for batch in [input_data[i:i+MAX_BATCH_SIZE] for i in range(0, len(input_data), MAX_BATCH_SIZE)])
+                        }
+                    )
+                    return final_response
         elif model_type == ModelType.LLM:
             return await self.async_client.chat.completions.create(**api_kwargs)
         elif model_type == ModelType.IMAGE_GENERATION:
